@@ -15,4 +15,4 @@ cp .config.$1 .config
 mkdir -p $target
 make clean
 make
-mv out/*000.bin $target
+mv out/*.bin $target
