@@ -47,7 +47,7 @@ mdf_timer_event(struct timer *t)
     mdf.last_df = df;
     mdf.last_d0 = d0;
 
-    if (abs(df) >= mdf.df_threshold) {
+    if (df >= mdf.df_threshold) {
         mdf.triggered = 1;
         mdf.trigger_reason = MDF_REASON_DF;
         mdf.active = 0;
