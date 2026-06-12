@@ -26,6 +26,7 @@ struct hx71x_adc {
     struct gpio_out sclk; // pin used to generate clock for the hx71x
     struct sensor_bulk sb;
     struct load_cell_probe *lce;
+    uint8_t cell_index;
 };
 
 enum {
@@ -177,9 +178,14 @@ hx71x_read_adc(struct hx71x_adc *hx71x, uint8_t oid)
         counts = hx71x->last_error;
     }
 
-    // probe is optional, report if enabled
+    // Probe is optional, report if enabled.
+    // cell_index == 0xff keeps the original single-sample legacy path.
     if (hx71x->last_error == 0 && hx71x->lce) {
-        load_cell_probe_report_sample(hx71x->lce, counts);
+        if (hx71x->cell_index == 0xff)
+            load_cell_probe_report_sample(hx71x->lce, counts);
+        else
+            load_cell_probe_report_cell_sample(
+                hx71x->lce, hx71x->cell_index, counts);
     }
 
     // Add measurement to buffer
@@ -192,6 +198,8 @@ command_config_hx71x(uint32_t *args)
 {
     struct hx71x_adc *hx71x = oid_alloc(args[0]
                 , command_config_hx71x, sizeof(*hx71x));
+    hx71x->lce = NULL;
+    hx71x->cell_index = 0xff;
     hx71x->timer.func = hx71x_event;
     uint8_t gain_channel = args[1];
     if (gain_channel < 1 || gain_channel > 4) {
@@ -210,9 +218,22 @@ hx71x_attach_load_cell_probe(uint32_t *args) {
     uint8_t oid = args[0];
     struct hx71x_adc *hx71x = oid_lookup(oid, command_config_hx71x);
     hx71x->lce = load_cell_probe_oid_lookup(args[1]);
+    hx71x->cell_index = 0xff;
 }
 DECL_COMMAND(hx71x_attach_load_cell_probe, "hx71x_attach_load_cell_probe oid=%c"
     " load_cell_probe_oid=%c");
+
+
+void
+hx71x_attach_load_cell_probe_cell(uint32_t *args) {
+    uint8_t oid = args[0];
+    struct hx71x_adc *hx71x = oid_lookup(oid, command_config_hx71x);
+    hx71x->lce = load_cell_probe_oid_lookup(args[1]);
+    hx71x->cell_index = args[2];
+}
+DECL_COMMAND(hx71x_attach_load_cell_probe_cell,
+    "hx71x_attach_load_cell_probe_cell oid=%c load_cell_probe_oid=%c"
+    " cell_index=%c");
 
 // start/stop capturing ADC data
 void

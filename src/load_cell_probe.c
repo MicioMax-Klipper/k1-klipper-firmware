@@ -37,6 +37,9 @@ typedef int64_t fixedQ48_t;
 #define ERROR_OVERFLOW 1
 #define ERROR_WATCHDOG 2
 
+#define MDF_LC_MAX_CELLS 4
+#define MDF_LC_LEGACY_CELL_MASK 0
+
 // Flags
 enum {FLAG_IS_HOMING = 1 << 0
     , FLAG_IS_HOMING_TRIGGER = 1 << 1
@@ -55,8 +58,12 @@ struct load_cell_probe {
     fixedQ16_t trigger_grams_fixed;
     fixedQ2_t grams_per_count;
     struct sos_filter *sf;
-    fixedQ16_t last_filtered_grams;
     int32_t last_raw_sample;
+
+    // Multi-cell support. cell_mask == 0 keeps legacy single-sample behavior.
+    uint8_t cell_mask, cell_valid_mask, cell_update_mask;
+    int32_t cell_tare_counts[MDF_LC_MAX_CELLS];
+    int32_t cell_last_counts[MDF_LC_MAX_CELLS];
 };
 
 static inline uint8_t
@@ -127,9 +134,7 @@ void
 load_cell_probe_report_sample(struct load_cell_probe *lce
                                 , const int32_t sample)
 {
-    // Always save the latest raw sample
-    uint32_t ticks = timer_read_time();
-    lce->last_sample_ticks = ticks;
+    // Keep latest raw sample available for diagnostics.
     lce->last_raw_sample = sample;
 
     // only process samples when homing
@@ -139,6 +144,7 @@ load_cell_probe_report_sample(struct load_cell_probe *lce
     }
 
     // save new sample
+    uint32_t ticks = timer_read_time();
     lce->last_sample_ticks = ticks;
     lce->watchdog_count = 0;
 
@@ -168,11 +174,101 @@ load_cell_probe_report_sample(struct load_cell_probe *lce
     // perform filtering
     const fixedQ16_t filtered_grams = sosfilt(lce->sf, (fixedQ16_t)raw_grams);
 
-    lce->last_filtered_grams = filtered_grams;
+    // Update trigger state.
+    // On this machine, contact makes MCU-side grams negative.
+    // Trigger only on that contact direction, not on positive rebounds.
+    if (-filtered_grams >= lce->trigger_grams_fixed) {
+        try_trigger(lce, lce->last_sample_ticks);
+    }
+}
+
+// Used by HX71x sensors to report a raw ADC sample with a cell index.
+// When cell_mask is non-zero, selected cells are summed and filtered as
+// total force. TRIGGER_FORCE then means total grams on the plate/nozzle.
+void
+load_cell_probe_report_cell_sample(struct load_cell_probe *lce
+                                , uint8_t cell_index, const int32_t sample)
+{
+    if (cell_index >= MDF_LC_MAX_CELLS) {
+        return;
+    }
+
+    // If multi-cell mode is not enabled, keep legacy behavior.
+    if (lce->cell_mask == MDF_LC_LEGACY_CELL_MASK) {
+        load_cell_probe_report_sample(lce, sample);
+        return;
+    }
+
+    const uint8_t cell_bit = 1 << cell_index;
     lce->last_raw_sample = sample;
-    
-    // update trigger state
-    if (abs(filtered_grams) >= lce->trigger_grams_fixed) {
+    lce->cell_last_counts[cell_index] = sample;
+    lce->cell_valid_mask |= cell_bit;
+    lce->cell_update_mask |= cell_bit;
+
+    // Only process samples when homing.
+    uint8_t is_homing = is_flag_set(FLAG_IS_HOMING, lce);
+    if (!is_homing) {
+        return;
+    }
+
+    uint32_t ticks = timer_read_time();
+    lce->last_sample_ticks = ticks;
+    lce->watchdog_count = 0;
+
+    uint8_t await_homing = is_flag_set(FLAG_AWAIT_HOMING, lce);
+    if (await_homing && timer_is_before(ticks, lce->homing_start_time)) {
+        return;
+    }
+    clear_flag(FLAG_AWAIT_HOMING, lce);
+
+    // Need all selected cells valid, and each selected cell updated once
+    // since the previous summed sample.
+    if ((lce->cell_valid_mask & lce->cell_mask) != lce->cell_mask) {
+        return;
+    }
+    if ((lce->cell_update_mask & lce->cell_mask) != lce->cell_mask) {
+        return;
+    }
+    lce->cell_update_mask &= ~lce->cell_mask;
+
+    fixedQ48_t sum_grams = 0;
+    uint8_t i;
+    for (i = 0; i < MDF_LC_MAX_CELLS; i++) {
+        if (!(lce->cell_mask & (1 << i)))
+            continue;
+
+        const int32_t counts = lce->cell_last_counts[i];
+
+        // Per-cell safety check using the legacy safety window width,
+        // shifted around the per-cell tare.
+        const int32_t legacy_min_delta = lce->safety_counts_min - lce->tare_counts;
+        const int32_t legacy_max_delta = lce->safety_counts_max - lce->tare_counts;
+        const int32_t cell_min = lce->cell_tare_counts[i] + legacy_min_delta;
+        const int32_t cell_max = lce->cell_tare_counts[i] + legacy_max_delta;
+
+        if (counts <= cell_min || counts >= cell_max) {
+            trigger_error(lce, ERROR_SAFETY_RANGE);
+            return;
+        }
+
+        const int32_t saved_tare = lce->tare_counts;
+        lce->tare_counts = lce->cell_tare_counts[i];
+        const fixedQ48_t cell_grams = counts_to_grams(lce, counts);
+        lce->tare_counts = saved_tare;
+
+        sum_grams += cell_grams;
+    }
+
+    if (overflows_int32(sum_grams)) {
+        trigger_error(lce, ERROR_OVERFLOW);
+        return;
+    }
+
+    const fixedQ16_t filtered_grams = sosfilt(lce->sf, (fixedQ16_t)sum_grams);
+
+    // Multi-cell trigger. Same sign convention as the legacy path:
+    // contact makes MCU-side grams negative.
+    if (-filtered_grams >= lce->trigger_grams_fixed) {
         try_trigger(lce, lce->last_sample_ticks);
     }
 }
@@ -223,6 +319,11 @@ set_endstop_range(struct load_cell_probe *lce
     lce->trigger_grams = trigger_grams;
     lce->trigger_grams_fixed = trigger_grams << FIXEDQ16_FRAC_BITS;
     lce->grams_per_count = grams_per_count;
+
+    lce->cell_tare_counts[0] = tare_counts;
+    lce->cell_tare_counts[1] = tare_counts;
+    lce->cell_tare_counts[2] = tare_counts;
+    lce->cell_tare_counts[3] = tare_counts;
 }
 
 // Create a load_cell_probe
@@ -238,8 +339,17 @@ command_config_load_cell_probe(uint32_t *args)
     lce->sf = sos_filter_oid_lookup(args[1]);
     set_endstop_range(lce, 0, 0, 0, 0, 0);
 
-    lce->last_filtered_grams = 0;
-    lce->last_raw_sample = 0;
+    lce->cell_mask = MDF_LC_LEGACY_CELL_MASK;
+    lce->cell_valid_mask = 0;
+    lce->cell_update_mask = 0;
+    lce->cell_tare_counts[0] = 0;
+    lce->cell_tare_counts[1] = 0;
+    lce->cell_tare_counts[2] = 0;
+    lce->cell_tare_counts[3] = 0;
+    lce->cell_last_counts[0] = 0;
+    lce->cell_last_counts[1] = 0;
+    lce->cell_last_counts[2] = 0;
+    lce->cell_last_counts[3] = 0;
 }
 DECL_COMMAND(command_config_load_cell_probe, "config_load_cell_probe"
                                                " oid=%c sos_filter_oid=%c");
@@ -249,12 +359,6 @@ struct load_cell_probe *
 load_cell_probe_oid_lookup(uint8_t oid)
 {
     return oid_lookup(oid, command_config_load_cell_probe);
-}
-
-int32_t
-load_cell_probe_get_last_raw_sample(struct load_cell_probe *lce)
-{
-    return lce->last_raw_sample;
 }
 
 // Set the triggering range and tare value
@@ -268,6 +372,32 @@ command_load_cell_probe_set_range(uint32_t *args)
 DECL_COMMAND(command_load_cell_probe_set_range, "load_cell_probe_set_range"
     " oid=%c safety_counts_min=%i safety_counts_max=%i tare_counts=%i"
     " trigger_grams=%u grams_per_count=%i");
+
+
+void
+command_load_cell_probe_set_cell_mask(uint32_t *args)
+{
+    struct load_cell_probe *lce = load_cell_probe_oid_lookup(args[0]);
+    lce->cell_mask = args[1] & 0x0f;
+    lce->cell_valid_mask = 0;
+    lce->cell_update_mask = 0;
+}
+DECL_COMMAND(command_load_cell_probe_set_cell_mask,
+    "load_cell_probe_set_cell_mask oid=%c cell_mask=%c");
+
+void
+command_load_cell_probe_set_cell_tare(uint32_t *args)
+{
+    struct load_cell_probe *lce = load_cell_probe_oid_lookup(args[0]);
+    uint8_t cell_index = args[1];
+    if (cell_index >= MDF_LC_MAX_CELLS)
+        shutdown("invalid load cell index");
+    lce->cell_tare_counts[cell_index] = args[2];
+    lce->cell_valid_mask &= ~(1 << cell_index);
+    lce->cell_update_mask &= ~(1 << cell_index);
+}
+DECL_COMMAND(command_load_cell_probe_set_cell_tare,
+    "load_cell_probe_set_cell_tare oid=%c cell_index=%c tare_counts=%i");
 
 // Home an axis
 void
@@ -314,8 +444,10 @@ command_load_cell_probe_query_state(uint32_t *args)
 }
 DECL_COMMAND(command_load_cell_probe_query_state
                 , "load_cell_probe_query_state oid=%c");
+
+
 int32_t
-load_cell_probe_get_last_filtered_grams(struct load_cell_probe *lce)
+load_cell_probe_get_last_raw_sample(struct load_cell_probe *lce)
 {
-    return lce->last_filtered_grams;
+    return lce->last_raw_sample;
 }

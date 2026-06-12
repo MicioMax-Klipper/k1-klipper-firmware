@@ -12,6 +12,17 @@ enum {
     MDF_REASON_SAFE = 2,
 };
 
+#define MDF_DF_RING_SIZE 100
+#define MDF_DF_LOG_MIN_DEFAULT 500
+
+struct mdf_df_record {
+    int32_t raw;
+    int32_t df;
+    int32_t d0;
+    int32_t sum_df;
+    uint8_t hits;
+};
+
 struct mdf_state {
     struct timer timer;
     struct load_cell_probe *lce;
@@ -19,12 +30,23 @@ struct mdf_state {
     uint32_t sample_ticks;
     int32_t df_threshold;
     int32_t safe_threshold;
+    uint8_t required_hits;
+    int32_t df_noise_floor;
+    int8_t polarity;
+    int32_t df_log_min;
 
     int32_t raw0;
     int32_t prev_raw;
     int32_t last_raw;
     int32_t last_df;
     int32_t last_d0;
+    int32_t df_sum;
+
+    uint8_t hit_count;
+
+    struct mdf_df_record df_ring[MDF_DF_RING_SIZE];
+    uint8_t df_ring_pos;
+    uint8_t df_ring_count;
 
     uint8_t active;
     uint8_t triggered;
@@ -32,6 +54,47 @@ struct mdf_state {
 };
 
 static struct mdf_state mdf;
+
+static void
+mdf_ring_clear(void)
+{
+    mdf.df_ring_pos = 0;
+    mdf.df_ring_count = 0;
+    mdf.df_sum = 0;
+}
+
+static void
+mdf_ring_log(int32_t raw, int32_t df, int32_t d0)
+{
+    if (abs(df) < mdf.df_log_min)
+        return;
+
+    struct mdf_df_record *r = &mdf.df_ring[mdf.df_ring_pos];
+
+    r->raw = raw;
+    r->df = df;
+    r->d0 = d0;
+    r->sum_df = mdf.df_sum;
+    r->hits = mdf.hit_count;
+
+    mdf.df_ring_pos++;
+    if (mdf.df_ring_pos >= MDF_DF_RING_SIZE)
+        mdf.df_ring_pos = 0;
+
+    if (mdf.df_ring_count < MDF_DF_RING_SIZE)
+        mdf.df_ring_count++;
+}
+
+static void
+mdf_trigger(uint8_t reason, int32_t raw, int32_t df, int32_t d0)
+{
+    mdf.triggered = 1;
+    mdf.trigger_reason = reason;
+    mdf.active = 0;
+
+    sendf("mdf_trigger reason=%c raw=%i df=%i d0=%i",
+          mdf.trigger_reason, raw, df, d0);
+}
 
 static uint_fast8_t
 mdf_timer_event(struct timer *t)
@@ -42,30 +105,32 @@ mdf_timer_event(struct timer *t)
     int32_t raw = load_cell_probe_get_last_raw_sample(mdf.lce);
     int32_t df = raw - mdf.prev_raw;
     int32_t d0 = raw - mdf.raw0;
+    int32_t event_df = df * mdf.polarity;
+
+    mdf.df_sum += df;
 
     mdf.last_raw = raw;
     mdf.last_df = df;
     mdf.last_d0 = d0;
 
-    if (df >= mdf.df_threshold) {
-        mdf.triggered = 1;
-        mdf.trigger_reason = MDF_REASON_DF;
-        mdf.active = 0;
+    if (event_df < mdf.df_noise_floor) {
+        // Ignore small normalized changes, zero, and opposite-direction changes.
+    } else if (event_df >= mdf.df_threshold) {
+        if (mdf.hit_count < 255)
+            mdf.hit_count++;
+    } else {
+        mdf.hit_count = 0;
+    }
 
-        sendf("mdf_trigger reason=%c raw=%i df=%i d0=%i",
-              mdf.trigger_reason, raw, df, d0);
+    mdf_ring_log(raw, df, d0);
 
+    if (mdf.hit_count >= mdf.required_hits) {
+        mdf_trigger(MDF_REASON_DF, raw, df, d0);
         return SF_DONE;
     }
 
     if (abs(d0) >= mdf.safe_threshold) {
-        mdf.triggered = 1;
-        mdf.trigger_reason = MDF_REASON_SAFE;
-        mdf.active = 0;
-
-        sendf("mdf_trigger reason=%c raw=%i df=%i d0=%i",
-              mdf.trigger_reason, raw, df, d0);
-
+        mdf_trigger(MDF_REASON_SAFE, raw, df, d0);
         return SF_DONE;
     }
 
@@ -101,14 +166,30 @@ command_mdf_config(uint32_t *args)
     mdf.sample_ticks = args[1];
     mdf.df_threshold = args[2];
     mdf.safe_threshold = args[3];
+    mdf.required_hits = args[4];
+    mdf.df_noise_floor = args[5];
+    mdf.polarity = args[6] ? -1 : 1;
+    mdf.df_log_min = args[7];
+
+    if (!mdf.required_hits)
+        mdf.required_hits = 1;
+
+    if (mdf.df_noise_floor < 0)
+        mdf.df_noise_floor = 0;
+
+    if (mdf.df_log_min < 0)
+        mdf.df_log_min = MDF_DF_LOG_MIN_DEFAULT;
 
     mdf.active = 0;
     mdf.triggered = 0;
     mdf.trigger_reason = MDF_REASON_NONE;
+    mdf.hit_count = 0;
     mdf.timer.func = mdf_timer_event;
+
+    mdf_ring_clear();
 }
 DECL_COMMAND(command_mdf_config,
-    "mdf_config oid=%c sample_ticks=%u df_threshold=%i safe_threshold=%i");
+    "mdf_config oid=%c sample_ticks=%u df_threshold=%i safe_threshold=%i required_hits=%c df_noise_floor=%i invert=%c df_log_min=%i");
 
 void
 command_mdf_start(uint32_t *args)
@@ -125,6 +206,8 @@ command_mdf_start(uint32_t *args)
     mdf.last_raw = raw;
     mdf.last_df = 0;
     mdf.last_d0 = 0;
+    mdf.df_sum = 0;
+    mdf.hit_count = 0;
     mdf.triggered = 0;
     mdf.trigger_reason = MDF_REASON_NONE;
     mdf.active = 1;
@@ -150,3 +233,36 @@ command_mdf_status_query(uint32_t *args)
           mdf.raw0, mdf.last_raw, mdf.last_df, mdf.last_d0);
 }
 DECL_COMMAND(command_mdf_status_query, "mdf_status_query");
+
+void
+command_mdf_clear(uint32_t *args)
+{
+    mdf_ring_clear();
+    mdf.hit_count = 0;
+}
+DECL_COMMAND(command_mdf_clear, "mdf_clear");
+
+void
+command_mdf_dump(uint32_t *args)
+{
+    sendf("mdf_dump_begin count=%c pos=%c sum=%i",
+          mdf.df_ring_count, mdf.df_ring_pos, mdf.df_sum);
+
+    uint8_t start = 0;
+    if (mdf.df_ring_count >= MDF_DF_RING_SIZE)
+        start = mdf.df_ring_pos;
+
+    for (uint8_t i = 0; i < mdf.df_ring_count; i++) {
+        uint8_t idx = start + i;
+        if (idx >= MDF_DF_RING_SIZE)
+            idx -= MDF_DF_RING_SIZE;
+
+        struct mdf_df_record *r = &mdf.df_ring[idx];
+
+        sendf("mdf_dump_item i=%c raw=%i df=%i d0=%i sum=%i hits=%c",
+              i, r->raw, r->df, r->d0, r->sum_df, r->hits);
+    }
+
+    sendf("mdf_dump_end count=%c", mdf.df_ring_count);
+}
+DECL_COMMAND(command_mdf_dump, "mdf_dump");
