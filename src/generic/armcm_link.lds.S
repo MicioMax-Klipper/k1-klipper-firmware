@@ -31,6 +31,16 @@ SECTIONS
     } > rom
 
     . = ALIGN(4);
+    .ARM.extab : {
+        *(.ARM.extab* .gnu.linkonce.armextab.*)
+    } > rom
+
+    __exidx_start = .;
+    .ARM.exidx : {
+        *(.ARM.exidx* .gnu.linkonce.armexidx.*)
+    } > rom
+    __exidx_end = .;
+
     _data_flash = .;
 
 #if CONFIG_ARMCM_RAM_VECTORTABLE
@@ -73,8 +83,5 @@ SECTIONS
         // that isn't needed so no need to include them in the binary.
         *(.init)
         *(.fini)
-        // Don't include exception tables
-        *(.ARM.extab)
-        *(.ARM.exidx)
     }
 }

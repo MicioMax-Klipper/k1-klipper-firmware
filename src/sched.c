@@ -260,7 +260,18 @@ run_tasks(void)
                 // Sleep processor (only run timers) until tasks woken
                 SchedStatus.tasks_status = SchedStatus.tasks_busy = TS_IDLE;
                 do {
+#if CONFIG_MACH_LINUX
                     irq_wait();
+#else
+#if CONFIG_WANT_PRTOUCH_V2 || CONFIG_HAVE_PRTOUCH
+                    // Creality PRTouch v2 uses a cooperative polling task while idle.
+                    asm volatile("cpsie i" ::: "memory");
+                    extern void prtouch_task(void);
+                    prtouch_task();
+#else
+                    irq_wait();
+#endif
+#endif
                 } while (SchedStatus.tasks_status != TS_REQUESTED);
             }
             irq_enable();

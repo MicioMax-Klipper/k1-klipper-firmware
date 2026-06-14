@@ -30,4 +30,5 @@ src-$(CONFIG_NEED_SENSOR_BULK) += sensor_bulk.c
 src-$(CONFIG_NEED_SOS_FILTER) += sos_filter.c
 src-$(CONFIG_WANT_LOAD_CELL_PROBE) += load_cell_probe.c
 src-$(CONFIG_WANT_LOAD_CELL_PROBE) += mdf_loadcell_tools.c
-src-$(CONFIG_WANT_LOAD_CELL_PROBE) += prtouch_v2.c
+src-$(CONFIG_HAVE_PRTOUCH) += hx711s.c dirzctl.c
+src-$(CONFIG_WANT_PRTOUCH_V2) += prtouch_v2.c

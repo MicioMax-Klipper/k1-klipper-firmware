@@ -169,10 +169,12 @@ config WANT_THERMOCOUPLE
 config WANT_HX71X
     bool
     depends on HAVE_GPIO
+    default n if HAVE_PRTOUCH
     default y
 config WANT_ADS1220
     bool
     depends on WANT_SPI
+    default n if HAVE_PRTOUCH
     default y
 config WANT_LDC1612
     bool
@@ -181,19 +183,31 @@ config WANT_LDC1612
 config WANT_SENSOR_ANGLE
     bool
     depends on WANT_SPI
+    default n if HAVE_PRTOUCH
     default y
 config NEED_SENSOR_BULK
     bool
     depends on WANT_ADXL345 || WANT_LIS2DW || WANT_MPU9250 || WANT_ICM20948 \
         || WANT_HX71X || WANT_ADS1220 || WANT_LDC1612 || WANT_SENSOR_ANGLE
+    default n if HAVE_PRTOUCH
     default y
 config WANT_LOAD_CELL_PROBE
     bool
     depends on WANT_HX71X || WANT_ADS1220
+    default n if HAVE_PRTOUCH
     default y
+config HAVE_PRTOUCH
+    bool "Support Creality PRTouch bed firmware helpers"
+    default n
+
+config WANT_PRTOUCH_V2
+    bool "Support Creality PRTouch v2 firmware module"
+    depends on HAVE_GPIO
+    default n
 config NEED_SOS_FILTER
     bool
     depends on WANT_LOAD_CELL_PROBE
+    default n if HAVE_PRTOUCH
     default y
 menu "Optional features (to reduce code size)"
     depends on HAVE_LIMITED_CODE_SIZE
