@@ -95,3 +95,44 @@ Then flash from the printer:
     flash_bed_mcu /usr/data/klipper/fw/K1/bed0_110_G21-bed0_117_001.bin
 
 Do not flash blindly. Backup your existing firmware/config first.
+
+## Toolchain and build instructions
+
+These instructions are intentionally minimal. They are for a Debian / Ubuntu /
+WSL style build host.
+
+Install the build dependencies:
+
+    sudo apt update
+    sudo apt install -y git python3 build-essential make \
+        gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi \
+        libusb-1.0-0-dev pkg-config stm32flash dfu-util
+
+Clone this repository and select the experimental branch:
+
+    git clone https://github.com/MicioMax-Klipper/k1-klipper-firmware.git
+    cd k1-klipper-firmware
+    git checkout k1max-creality-prtouch-bed
+
+Build only the K1 Max bed MCU firmware:
+
+    ./_build.sh bed
+
+The compiled firmware is written here:
+
+    outfw/bed0_110_G21-bed0_117_001.bin
+
+Known tested binary:
+
+    019927067a20d1706c27456fca16dadb2c887b83f894f0cfc71fbe8bd70b572f  outfw/bed0_110_G21-bed0_117_001.bin
+
+Copy it to the printer, for example:
+
+    scp outfw/bed0_110_G21-bed0_117_001.bin root@k1max:/usr/data/klipper/fw/K1/bed0_110_G21-bed0_117_001.bin
+
+Then flash it from the printer side:
+
+    flash_bed_mcu /usr/data/klipper/fw/K1/bed0_110_G21-bed0_117_001.bin
+
+Read the host/config repository documentation too. This firmware alone is not a
+complete working system.
